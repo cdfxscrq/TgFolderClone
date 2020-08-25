@@ -2,7 +2,10 @@ import subprocess
 import threading
 import re
 import os
-from time import sleep, monotonic
+import sys
+import signal
+import shutil
+from time import sleep, monotonic, time
 
 from telegram import Update, ParseMode
 from telegram.constants import MAX_MESSAGE_LENGTH
@@ -11,16 +14,44 @@ from telegram.ext import Updater, CommandHandler, CallbackContext, run_async
 
 import config
 
+if 'DYNO' not in os.environ:
+    try:
+        default_encoding = "cp" + sys.argv[1].split("Active code page: ")[1]
+    except IndexError:
+        raise RuntimeError("Run again using the .bat file.")
+
 TOKEN = config.BOT_TOKEN
 updater = Updater(TOKEN, use_context=True)
 dp = updater.dispatcher
 threads = threading.BoundedSemaphore(1)
 allowed_chats = config.ALLOWED_CHATS
 queue = []
+proc = None
+botStartTime = time()
+
+
+def get_readable_time(seconds: int) -> str:
+    result = ''
+    (days, remainder) = divmod(seconds, 86400)
+    days = int(days)
+    if days != 0:
+        result += f'{days}d'
+    (hours, remainder) = divmod(remainder, 3600)
+    hours = int(hours)
+    if hours != 0:
+        result += f'{hours}h'
+    (minutes, seconds) = divmod(remainder, 60)
+    minutes = int(minutes)
+    if minutes != 0:
+        result += f'{minutes}m'
+    seconds = int(seconds)
+    result += f'{seconds}s'
+    return result
 
 
 @run_async
 def clone(update: Update, context: CallbackContext):
+    global proc
     chat_id = str(update.effective_chat.id)
     user_id = str(update.message.from_user.id)
     bot = context.bot
@@ -48,17 +79,21 @@ def clone(update: Update, context: CallbackContext):
 
     threads.acquire()
     sleep(3)
-    bot.sendMessage(update.effective_chat.id, "Started", timeout=5)
     if 'DYNO' in os.environ:
         cmd = f"python3 folderclone.py -s {source} -d {dest} --threads {thread_amount}"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True, preexec_fn=os.setsid)
     else:
-        cmd = f"py folderclone.py -s {source} -d {dest} --threads {thread_amount}"
-    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
+        cmd = f"py folderclone.py -s {source} -d {dest} --threads {thread_amount} -e {default_encoding}"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
     message = None
     to_edit_bool = True
     to_send = ""
 
     for line in proc.stdout:
+        try:
+            line = line.encode('cp1252').decode(default_encoding)
+        except:
+            pass
         counter = int(monotonic() - start_time)
 
         if len(to_send) >= MAX_MESSAGE_LENGTH:
@@ -87,16 +122,16 @@ def clone(update: Update, context: CallbackContext):
             to_send += f"{line}"
         to_send = to_send.replace("\n\n", "\n")
 
-        print(repr(line))
+        print(line)
 
         if re.match(r"Copying from (.*) to (.*)", line):
             if message:
                 if not to_edit_bool:
-                    bot.sendMessage(update.effective_chat.id, to_send)
+                    bot.sendMessage(update.effective_chat.id, to_send, timeout=10)
                 else:
-                    message.edit_text(to_send)
+                    message.edit_text(to_send, timeout=10)
             else:
-                bot.sendMessage(update.effective_chat.id, to_send)
+                bot.sendMessage(update.effective_chat.id, to_send, timeout=10)
             counter = 0
             to_edit_bool = False
             to_send = ""
@@ -121,11 +156,10 @@ def clone(update: Update, context: CallbackContext):
         proc.stdout.flush()
     try:
         message.edit_text(to_send)
-    except BadRequest:
+    except (TimedOut, RetryAfter, BadRequest):
         pass
 
-
-    bot.sendMessage(update.effective_chat.id, "Done")
+    proc = None
     sleep(10)
     queue.pop(0)
     threads.release()
@@ -158,8 +192,36 @@ def status(update: Update, context: CallbackContext):
     update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
 
+@run_async
+def stop(update: Update, context: CallbackContext):
+    global proc
+    chat_id = str(update.effective_chat.id)
+
+    if chat_id not in allowed_chats:
+        return
+
+    msg = context.bot.sendMessage(update.effective_chat.id, "Killing current running job.")
+
+    if 'DYNO' not in os.environ:
+        subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
+    else:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+
+    sleep(5)
+    msg.edit_text("Current running job killed.")
+
+
+@run_async
+def uptime(update: Update, context: CallbackContext):
+    currentTime = get_readable_time((time() - botStartTime))
+    stats = f'Bot Uptime: {currentTime}'
+    context.bot.sendMessage(update.effective_chat.id, stats)
+
+
 dp.add_handler(CommandHandler('clone', clone))
+dp.add_handler(CommandHandler('uptime', uptime))
 dp.add_handler(CommandHandler('status', status))
+dp.add_handler(CommandHandler('stop', stop))
 print("Bot Started.")
 updater.start_polling()
 updater.idle()

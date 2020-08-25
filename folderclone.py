@@ -3,6 +3,7 @@ import threading
 import json
 import socket
 import random
+import os
 
 from argparse import ArgumentParser
 from glob import glob
@@ -27,12 +28,14 @@ class MultiFolderClone():
 
     drive_to_use = 1
     files_to_copy = []
+    encoding = None
     threads = None
     id_whitelist = None
     id_blacklist = None
     name_whitelist = None
     name_blacklist = None
     share_publicly = False
+    file_copy_error = 0
     bad_drives = []
     google_opts = ['trashed = false']
     override_thread_check = False
@@ -71,6 +74,8 @@ class MultiFolderClone():
         self.dest = dest
         if isinstance(dest, str):
             self.dest = [dest]
+        if options.get('encoding') is not None:
+            self.encoding = options['encoding']
         if options.get('thread_count') is not None:
             self.thread_count = int(options['thread_count'])
         if options.get('skip_bad_dests') is not None:
@@ -114,7 +119,10 @@ class MultiFolderClone():
 
     def _create_drive(self):
         while True:
-            random_acc = random.choice(self.accounts)
+            try:
+                random_acc = random.choice(self.accounts)
+            except IndexError:
+                raise RuntimeError("No more SA accounts to choose from.")
             try:
                 credentials = Credentials.from_service_account_file(random_acc, scopes=[
                     "https://www.googleapis.com/auth/drive"
@@ -153,6 +161,9 @@ class MultiFolderClone():
                 elif reason == 'storageQuotaExceeded':
                     print('Got storageQuotaExceeded error. You are not using a Shared Drive.')
                     return False
+                elif reason == "cannotCopyFile":
+                    self.file_copy_error += 1
+                    return True
                 elif reason == 'teamDriveFileLimitExceeded':
                     raise RuntimeError('The Shared Drive is full. No more files can be copied to it.')
                 elif self.error_codes[reason]:
@@ -261,14 +272,18 @@ class MultiFolderClone():
         self.files_to_copy = [(i['id'], dest) for i in files_to_copy]
 
         self._log('Copying files')
+
+        fullname = display_line + folder_name
+        if 'DYNO' not in os.environ:
+            fullname = fullname.encode(self.encoding, errors='replace').decode(self.encoding)
+
         if files_to_copy:
             while self.files_to_copy:
                 files_to_copy = self.files_to_copy
                 self.files_to_copy = []
                 running_threads = []
 
-                fullname = display_line + folder_name
-                pbar = CounterProgress(f"{fullname}", max=len(files_to_copy))
+                pbar = CounterProgress(f"{fullname}", max=len(files_to_copy), encoding=self.encoding)
                 pbar.update()
 
                 # copy
@@ -283,7 +298,11 @@ class MultiFolderClone():
                     thread.start()
                     pbar.next()
 
-                pbar.finishupdate()
+                if self.file_copy_error:
+                    pbar.finish_update_with_error(self.file_copy_error)
+                    self.file_copy_error = 0
+                else:
+                    pbar.finish_update()
                 pbar.finish()
 
                 # join all threads
@@ -297,15 +316,15 @@ class MultiFolderClone():
                 self.bad_drives = []
 
                 # If there is less than 2 SAs, exit
-                if len(self.accounts) == 1:
+                if len(self.accounts) < 2:
                     raise RuntimeError('Out of SAs.')
 
             # copy completed
             #print(display_line + folder_name + ' | Synced')
         elif files_source and len(files_source) <= len(files_dest):
-            print(display_line + folder_name + ' | Up to date')
+            print(fullname + ' | Up to date')
         else:
-            print(display_line + folder_name)
+            print(fullname)
 
         for i in folders_dest:
             folders_copied[i['name']] = i['id']
@@ -378,6 +397,7 @@ class MultiFolderClone():
 
 def main():
     parse = ArgumentParser(description='A tool intended to copy large files from one folder to another.')
+    parse.add_argument('--encoding', '-e', type=str, default=None, help='Set the encoding.')
     parse.add_argument('--width', '-w', type=int, default=1, help='Set the width of the view option.')
     parse.add_argument('--path', '-p', default='accounts', help='Specify an alternative path to the service accounts.')
     parse.add_argument('--threads', type=int, default=None, help='Specify a different thread count. Cannot be greater than the amount of service accounts available.')
@@ -400,7 +420,8 @@ def main():
         verbose=args.verbose,
         skip_bad_dests=args.skip_bad_dests,
         override_thread_check=args.force_threads,
-        share_publicly=args.share_publicly
+        share_publicly=args.share_publicly,
+        encoding=args.encoding
     )
     try:
         mfc.clone()
